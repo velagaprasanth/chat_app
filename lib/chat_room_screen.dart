@@ -70,21 +70,72 @@ class _ChatRoomScreenState extends State<ChatRoomScreen> {
     _messageController.clear();
 
     try {
-      await FirebaseFirestore.instance
+      final roomRef = FirebaseFirestore.instance
           .collection('chat_rooms')
-          .doc(_chatRoomId)
-          .collection('messages')
-          .add({
+          .doc(_chatRoomId);
+
+      await roomRef.collection('messages').add({
         'text': message,
         'senderId': widget.currentUser.uid,
         'timestamp': FieldValue.serverTimestamp(),
         'seen': false,
       });
+
+      await roomRef.set({
+        'lastActivity': FieldValue.serverTimestamp(),
+        'lastMessageText': message,
+        'lastMessageSenderId': widget.currentUser.uid,
+        'lastMessageTimestamp': FieldValue.serverTimestamp(),
+      }, SetOptions(merge: true));
     } catch (e) {
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(content: Text('Failed to send message: $e')),
       );
     }
+  }
+
+  Future<void> _deleteMessage(String messageId) async {
+    final roomRef = FirebaseFirestore.instance.collection('chat_rooms').doc(_chatRoomId);
+    final messageRef = roomRef.collection('messages').doc(messageId);
+    await messageRef.delete();
+
+    // Recompute last message metadata efficiently
+    final latest = await roomRef
+        .collection('messages')
+        .orderBy('timestamp', descending: true)
+        .limit(1)
+        .get();
+    if (latest.docs.isEmpty) {
+      await roomRef.set({
+        'lastMessageText': null,
+        'lastMessageSenderId': null,
+        'lastMessageTimestamp': null,
+        'lastActivity': FieldValue.serverTimestamp(),
+      }, SetOptions(merge: true));
+    } else {
+      final data = latest.docs.first.data() as Map<String, dynamic>;
+      await roomRef.set({
+        'lastMessageText': data['text'],
+        'lastMessageSenderId': data['senderId'],
+        'lastMessageTimestamp': data['timestamp'],
+        'lastActivity': FieldValue.serverTimestamp(),
+      }, SetOptions(merge: true));
+    }
+  }
+
+  String _presenceText(Map<String, dynamic>? userData) {
+    if (userData == null) return '';
+    final bool online = userData['online'] == true;
+    if (online) return 'Online';
+    final Timestamp? lastSeenTs = userData['lastSeen'] as Timestamp?;
+    if (lastSeenTs == null) return 'Offline';
+    final dt = lastSeenTs.toDate();
+    final now = DateTime.now();
+    final diff = now.difference(dt);
+    if (diff.inMinutes < 1) return 'Last seen just now';
+    if (diff.inMinutes < 60) return 'Last seen ${diff.inMinutes}m ago';
+    if (diff.inHours < 24) return 'Last seen ${diff.inHours}h ago';
+    return 'Last seen on ${dt.day}/${dt.month}/${dt.year}';
   }
 
   @override
@@ -98,8 +149,40 @@ class _ChatRoomScreenState extends State<ChatRoomScreen> {
 
     return Scaffold(
       appBar: AppBar(
-        title: Text(widget.chatPartnerName),
-        backgroundColor: AppTheme.primaryColor,
+        titleSpacing: 0,
+        title: StreamBuilder<DocumentSnapshot<Map<String, dynamic>>>(
+          stream: FirebaseFirestore.instance.collection('users').doc(widget.chatPartnerId).snapshots(),
+          builder: (context, snapshot) {
+            final data = snapshot.data?.data();
+            return Row(
+              children: [
+                const SizedBox(width: 8),
+                CircleAvatar(
+                  backgroundColor: AppTheme.primaryColor,
+                  child: Text(
+                    widget.chatPartnerName[0].toUpperCase(),
+                    style: const TextStyle(color: Colors.white),
+                  ),
+                ),
+                const SizedBox(width: 12),
+                Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Text(
+                      widget.chatPartnerName,
+                      style: Theme.of(context).textTheme.titleMedium,
+                    ),
+                    Text(
+                      _presenceText(data),
+                      style: Theme.of(context).textTheme.bodySmall,
+                    ),
+                  ],
+                ),
+              ],
+            );
+          },
+        ),
       ),
       body: Column(
         children: [
@@ -133,50 +216,74 @@ class _ChatRoomScreenState extends State<ChatRoomScreen> {
                   padding: const EdgeInsets.all(16),
                   itemCount: messages.length,
                   itemBuilder: (ctx, index) {
-                    final messageData = messages[index].data() as Map<String, dynamic>;
+                    final doc = messages[index];
+                    final messageData = doc.data() as Map<String, dynamic>;
                     return MessageBubble(
                       message: messageData['text'] ?? '',
                       isMe: messageData['senderId'] == widget.currentUser.uid,
                       timestamp: messageData['timestamp'],
                       seen: messageData['seen'] ?? false,
+                      onDelete: () async {
+                        final canDelete = messageData['senderId'] == widget.currentUser.uid;
+                        if (!canDelete) return;
+                        final confirmed = await showDialog<bool>(
+                          context: context,
+                          builder: (c) => AlertDialog(
+                            title: const Text('Delete message?'),
+                            content: const Text('This action cannot be undone.'),
+                            actions: [
+                              TextButton(onPressed: () => Navigator.pop(c, false), child: const Text('Cancel')),
+                              TextButton(onPressed: () => Navigator.pop(c, true), child: const Text('Delete')),
+                            ],
+                          ),
+                        );
+                        if (confirmed == true) {
+                          await _deleteMessage(doc.id);
+                        }
+                      },
                     );
                   },
                 );
               },
             ),
           ),
-          Container(
-            padding: const EdgeInsets.all(8),
-            color: Colors.white,
-            child: Row(
-              children: [
-                Expanded(
-                  child: TextField(
-                    controller: _messageController,
-                    decoration: InputDecoration(
-                      hintText: 'Type a message...',
-                      border: OutlineInputBorder(
-                        borderRadius: BorderRadius.circular(25),
-                        borderSide: BorderSide.none,
-                      ),
-                      filled: true,
-                      fillColor: AppTheme.backgroundColor,
-                      contentPadding: const EdgeInsets.symmetric(
-                        horizontal: 20,
-                        vertical: 10,
+          SafeArea(
+            top: false,
+            child: Container(
+              padding: const EdgeInsets.fromLTRB(12, 8, 12, 8),
+              color: Colors.white,
+              child: Row(
+                children: [
+                  Expanded(
+                    child: TextField(
+                      controller: _messageController,
+                      minLines: 1,
+                      maxLines: 5,
+                      decoration: InputDecoration(
+                        hintText: 'Type a message...',
+                        border: OutlineInputBorder(
+                          borderRadius: BorderRadius.circular(24),
+                          borderSide: BorderSide.none,
+                        ),
+                        filled: true,
+                        fillColor: const Color(0xFFF0EFF4),
+                        contentPadding: const EdgeInsets.symmetric(
+                          horizontal: 20,
+                          vertical: 12,
+                        ),
                       ),
                     ),
                   ),
-                ),
-                const SizedBox(width: 8),
-                CircleAvatar(
-                  backgroundColor: AppTheme.primaryColor,
-                  child: IconButton(
-                    icon: const Icon(Icons.send, color: Colors.white),
-                    onPressed: _sendMessage,
+                  const SizedBox(width: 8),
+                  CircleAvatar(
+                    backgroundColor: AppTheme.primaryColor,
+                    child: IconButton(
+                      icon: const Icon(Icons.send, color: Colors.white),
+                      onPressed: _sendMessage,
+                    ),
                   ),
-                ),
-              ],
+                ],
+              ),
             ),
           ),
         ],
