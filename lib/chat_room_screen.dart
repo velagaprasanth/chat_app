@@ -45,6 +45,14 @@ class _ChatRoomScreenState extends State<ChatRoomScreen> {
         'lastActivity': FieldValue.serverTimestamp(),
       }, SetOptions(merge: true));
 
+      // Reset my unread counter upon opening chat
+      await FirebaseFirestore.instance
+          .collection('chat_rooms')
+          .doc(_chatRoomId)
+          .set({
+        'unread_${widget.currentUser.uid}': 0,
+      }, SetOptions(merge: true));
+
       setState(() => _isInitialized = true);
     } catch (e) {
       print('Error initializing chat room: $e');
@@ -86,6 +94,8 @@ class _ChatRoomScreenState extends State<ChatRoomScreen> {
         'lastMessageText': message,
         'lastMessageSenderId': widget.currentUser.uid,
         'lastMessageTimestamp': FieldValue.serverTimestamp(),
+        // Increment partner's unread counter so chat shows as unread for them
+        'unread_${widget.chatPartnerId}': FieldValue.increment(1),
       }, SetOptions(merge: true));
     } catch (e) {
       ScaffoldMessenger.of(context).showSnackBar(
@@ -123,6 +133,33 @@ class _ChatRoomScreenState extends State<ChatRoomScreen> {
     }
   }
 
+  Future<void> _markMessagesSeen() async {
+    try {
+      final roomRef = FirebaseFirestore.instance.collection('chat_rooms').doc(_chatRoomId);
+      final unseen = await roomRef
+          .collection('messages')
+          .where('senderId', isEqualTo: widget.chatPartnerId)
+          .where('seen', isEqualTo: false)
+          .get();
+      if (unseen.docs.isEmpty) {
+        await roomRef.set({
+          'unread_${widget.currentUser.uid}': 0,
+        }, SetOptions(merge: true));
+        return;
+      }
+      final batch = FirebaseFirestore.instance.batch();
+      for (final doc in unseen.docs) {
+        batch.update(doc.reference, {'seen': true});
+      }
+      await batch.commit();
+      await roomRef.set({
+        'unread_${widget.currentUser.uid}': 0,
+      }, SetOptions(merge: true));
+    } catch (_) {
+      // no-op
+    }
+  }
+
   String _presenceText(Map<String, dynamic>? userData) {
     if (userData == null) return '';
     final bool online = userData['online'] == true;
@@ -142,13 +179,27 @@ class _ChatRoomScreenState extends State<ChatRoomScreen> {
   Widget build(BuildContext context) {
     if (!_isInitialized) {
       return Scaffold(
-        appBar: AppBar(title: Text(widget.chatPartnerName)),
-        body: const Center(child: CircularProgressIndicator()),
+        backgroundColor: AppTheme.backgroundLight,
+        appBar: AppBar(
+          backgroundColor: AppTheme.backgroundLight,
+          foregroundColor: AppTheme.textPrimary,
+          elevation: 0,
+          title: Text(widget.chatPartnerName),
+        ),
+        body: const Center(
+          child: CircularProgressIndicator(
+            color: AppTheme.primaryColor,
+          ),
+        ),
       );
     }
 
     return Scaffold(
+      backgroundColor: AppTheme.backgroundLight,
       appBar: AppBar(
+        backgroundColor: AppTheme.backgroundLight,
+        foregroundColor: AppTheme.textPrimary,
+        elevation: 0,
         titleSpacing: 0,
         title: StreamBuilder<DocumentSnapshot<Map<String, dynamic>>>(
           stream: FirebaseFirestore.instance.collection('users').doc(widget.chatPartnerId).snapshots(),
@@ -204,6 +255,10 @@ class _ChatRoomScreenState extends State<ChatRoomScreen> {
                 }
 
                 final messages = snapshot.data?.docs ?? [];
+                // Mark incoming messages as seen and reset unread counter when viewing the chat
+                WidgetsBinding.instance.addPostFrameCallback((_) {
+                  _markMessagesSeen();
+                });
                 
                 if (messages.isEmpty) {
                   return const Center(
